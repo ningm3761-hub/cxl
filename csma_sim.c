@@ -6,14 +6,19 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <errno.h>
 
 #define MAX_LAT 2000000
 
+/*
+ * mode 0: Random injection
+ * mode 1: Basic CSMA
+ * mode 2: AIMD-based Adaptive CSMA
+ */
+
 typedef struct {
     int tid;
-    int mode;       // 0 = Random, 1 = Basic CSMA
-    int load;       // 10 ~ 100
+    int mode;
+    int load;       // 1 ~ 100
     int seconds;
     unsigned int seed;
 } worker_arg_t;
@@ -25,16 +30,16 @@ static volatile uint8_t *mem_area;
 static size_t mem_size = 64 * 1024 * 1024;
 
 static uint64_t attempts = 0;
-static uint64_t success = 0;
+static uint64_t success_count = 0;
 static uint64_t retry_count = 0;
 static uint64_t backoff_count = 0;
 
 static uint64_t latencies[MAX_LAT];
 static int lat_count = 0;
 
-static int stop_flag = 0;
+static volatile int stop_flag = 0;
 
-static uint64_t now_ns() {
+static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -47,6 +52,12 @@ static void busy_work_ns(uint64_t ns) {
     }
 }
 
+static void inc_stat(uint64_t *x) {
+    pthread_mutex_lock(&stat_lock);
+    (*x)++;
+    pthread_mutex_unlock(&stat_lock);
+}
+
 static void record_latency(uint64_t ns) {
     pthread_mutex_lock(&stat_lock);
     if (lat_count < MAX_LAT) {
@@ -55,65 +66,84 @@ static void record_latency(uint64_t ns) {
     pthread_mutex_unlock(&stat_lock);
 }
 
-static void inc_u64(uint64_t *x) {
-    pthread_mutex_lock(&stat_lock);
-    (*x)++;
-    pthread_mutex_unlock(&stat_lock);
-}
-
+/*
+ * Simulated CXL memory request:
+ * 1. Touch a random cache-line-sized location.
+ * 2. Add artificial service time to represent a CXL memory transaction.
+ */
 static void memory_request(unsigned int *seed) {
     size_t offset = (rand_r(seed) % (mem_size / 64)) * 64;
     mem_area[offset]++;
-    busy_work_ns(50000); // simulate CXL request service time: 50 us
+    busy_work_ns(50000); // 50 us simulated service time
 }
 
+/*
+ * Load control:
+ * Higher load means shorter idle time between requests.
+ */
+static void load_sleep(int load, unsigned int *seed) {
+    if (load < 100) {
+        int idle_us = (100 - load) * 20;
+        if (idle_us > 0) {
+            usleep(rand_r(seed) % idle_us);
+        }
+    }
+}
+
+/*
+ * Mode 0: Random / No Carrier Sense
+ * Threads always send requests. They block on the shared channel lock,
+ * so high load may create queueing delay and long tail latency.
+ */
 static void random_mode(worker_arg_t *arg) {
     unsigned int seed = arg->seed;
 
     while (!stop_flag) {
-        int idle_us = (100 - arg->load) * 20;
-        if (idle_us > 0) {
-            usleep(rand_r(&seed) % idle_us);
-        }
+        load_sleep(arg->load, &seed);
 
         uint64_t t1 = now_ns();
-        inc_u64(&attempts);
+        inc_stat(&attempts);
 
         pthread_mutex_lock(&channel_lock);
         memory_request(&seed);
         pthread_mutex_unlock(&channel_lock);
 
         uint64_t t2 = now_ns();
-        inc_u64(&success);
+
+        inc_stat(&success_count);
         record_latency(t2 - t1);
     }
 }
 
+/*
+ * Mode 1: Basic CSMA
+ * Before sending, a thread tries to sense whether the channel is idle.
+ * If the channel is busy, it backs off instead of waiting in a long queue.
+ */
 static void csma_mode(worker_arg_t *arg) {
     unsigned int seed = arg->seed;
     int backoff_window_us = 20;
 
     while (!stop_flag) {
-        int idle_us = (100 - arg->load) * 20;
-        if (idle_us > 0) {
-            usleep(rand_r(&seed) % idle_us);
-        }
+        load_sleep(arg->load, &seed);
+
+        inc_stat(&attempts);
 
         uint64_t t1 = now_ns();
-        inc_u64(&attempts);
 
         if (pthread_mutex_trylock(&channel_lock) == 0) {
             memory_request(&seed);
             pthread_mutex_unlock(&channel_lock);
 
             uint64_t t2 = now_ns();
-            inc_u64(&success);
+
+            inc_stat(&success_count);
             record_latency(t2 - t1);
 
             backoff_window_us = 20;
         } else {
-            inc_u64(&retry_count);
-            inc_u64(&backoff_count);
+            inc_stat(&retry_count);
+            inc_stat(&backoff_count);
 
             usleep(rand_r(&seed) % backoff_window_us);
 
@@ -124,13 +154,74 @@ static void csma_mode(worker_arg_t *arg) {
     }
 }
 
+/*
+ * Mode 2: AIMD-based Adaptive CSMA
+ * cwnd increases additively when transmissions succeed.
+ * cwnd decreases multiplicatively when the channel is busy.
+ */
+static void aimd_mode(worker_arg_t *arg) {
+    unsigned int seed = arg->seed;
+    int cwnd = 1;
+    int cwnd_max = 32;
+    int backoff_window_us = 20;
+
+    while (!stop_flag) {
+        load_sleep(arg->load, &seed);
+
+        int sent_in_round = 0;
+
+        for (int i = 0; i < cwnd && !stop_flag; i++) {
+            inc_stat(&attempts);
+
+            uint64_t t1 = now_ns();
+
+            if (pthread_mutex_trylock(&channel_lock) == 0) {
+                memory_request(&seed);
+                pthread_mutex_unlock(&channel_lock);
+
+                uint64_t t2 = now_ns();
+
+                inc_stat(&success_count);
+                record_latency(t2 - t1);
+
+                sent_in_round++;
+            } else {
+                inc_stat(&retry_count);
+                inc_stat(&backoff_count);
+
+                cwnd = cwnd / 2;
+                if (cwnd < 1) {
+                    cwnd = 1;
+                }
+
+                usleep(rand_r(&seed) % backoff_window_us);
+
+                if (backoff_window_us < 2000) {
+                    backoff_window_us *= 2;
+                }
+
+                break;
+            }
+        }
+
+        if (sent_in_round == cwnd) {
+            if (cwnd < cwnd_max) {
+                cwnd += 1; // additive increase
+            }
+            backoff_window_us = 20;
+        }
+    }
+}
+
 static void *worker(void *p) {
     worker_arg_t *arg = (worker_arg_t *)p;
 
     if (arg->mode == 0) {
         random_mode(arg);
-    } else {
+    } else if (arg->mode == 1) {
         csma_mode(arg);
+    } else {
+        aimd_mode(arg);
     }
 
     return NULL;
@@ -139,24 +230,45 @@ static void *worker(void *p) {
 static int cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a;
     uint64_t y = *(const uint64_t *)b;
+
     if (x < y) return -1;
     if (x > y) return 1;
     return 0;
 }
 
+/*
+ * Percentile function.
+ * Input p should be 50.0, 95.0, 99.0, etc.
+ */
 static uint64_t percentile(double p) {
-    if (lat_count == 0) return 0;
-    int idx = (int)(p * (lat_count - 1));
-    if (idx < 0) idx = 0;
-    if (idx >= lat_count) idx = lat_count - 1;
+    if (lat_count <= 0) {
+        return 0;
+    }
+
+    int idx = (int)((p / 100.0) * (lat_count - 1));
+
+    if (idx < 0) {
+        idx = 0;
+    }
+
+    if (idx >= lat_count) {
+        idx = lat_count - 1;
+    }
+
     return latencies[idx];
+}
+
+static const char *mode_name(int mode) {
+    if (mode == 0) return "random";
+    if (mode == 1) return "csma";
+    return "aimd";
 }
 
 int main(int argc, char **argv) {
     if (argc < 5) {
         printf("Usage: %s <mode> <load> <threads> <seconds>\n", argv[0]);
-        printf("mode: 0 = Random, 1 = Basic CSMA\n");
-        printf("Example: %s 0 50 4 10\n", argv[0]);
+        printf("mode: 0 = Random, 1 = Basic CSMA, 2 = AIMD CSMA\n");
+        printf("Example: %s 0 50 4 5\n", argv[0]);
         return 1;
     }
 
@@ -165,13 +277,23 @@ int main(int argc, char **argv) {
     int threads = atoi(argv[3]);
     int seconds = atoi(argv[4]);
 
-    if (mode != 0 && mode != 1) {
-        printf("Error: mode must be 0 or 1\n");
+    if (mode < 0 || mode > 2) {
+        printf("Error: mode must be 0, 1, or 2\n");
         return 1;
     }
 
     if (load < 1 || load > 100) {
         printf("Error: load must be between 1 and 100\n");
+        return 1;
+    }
+
+    if (threads < 1 || threads > 64) {
+        printf("Error: threads must be between 1 and 64\n");
+        return 1;
+    }
+
+    if (seconds < 1) {
+        printf("Error: seconds must be positive\n");
         return 1;
     }
 
@@ -185,6 +307,12 @@ int main(int argc, char **argv) {
 
     pthread_t *tids = malloc(sizeof(pthread_t) * threads);
     worker_arg_t *args = malloc(sizeof(worker_arg_t) * threads);
+
+    if (!tids || !args) {
+        printf("Error: malloc failed\n");
+        munmap((void *)mem_area, mem_size);
+        return 1;
+    }
 
     uint64_t start = now_ns();
 
@@ -210,20 +338,20 @@ int main(int argc, char **argv) {
 
     qsort(latencies, lat_count, sizeof(uint64_t), cmp_u64);
 
-    uint64_t p50 = percentile(0.50);
-    uint64_t p95 = percentile(0.95);
-    uint64_t p99 = percentile(0.99);
+    uint64_t p50 = percentile(50.0);
+    uint64_t p95 = percentile(95.0);
+    uint64_t p99 = percentile(99.0);
 
-    double goodput = success / elapsed_s;
+    double goodput = success_count / elapsed_s;
 
     printf("mode,load,threads,seconds,attempts,success,retry,backoff,goodput,delay_p50_ns,delay_p95_ns,delay_p99_ns\n");
     printf("%s,%d,%d,%d,%lu,%lu,%lu,%lu,%.2f,%lu,%lu,%lu\n",
-           mode == 0 ? "random" : "csma",
+           mode_name(mode),
            load,
            threads,
            seconds,
            attempts,
-           success,
+           success_count,
            retry_count,
            backoff_count,
            goodput,
